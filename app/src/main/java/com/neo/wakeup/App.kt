@@ -77,7 +77,7 @@ val THEMES = listOf(
 
 // ---------- Core ----------
 object Core {
-    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"
+    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"; const val CH_POLITE_DND = "polite_dnd"
     val ICON = R.drawable.ic_alarm
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
     private val waiters = HashMap<String, (Boolean) -> Unit>()
@@ -92,6 +92,10 @@ object Core {
         nm.createNotificationChannel(NotificationChannel(CH_INFO, "Messages", NotificationManager.IMPORTANCE_HIGH))
         val po = NotificationChannel(CH_POLITE, "Are you awake?", NotificationManager.IMPORTANCE_HIGH)
         po.setBypassDnd(true); nm.createNotificationChannel(po)
+        if (nm.isNotificationPolicyAccessGranted) {
+            val pd = NotificationChannel(CH_POLITE_DND, "Are you awake? (overrides Do Not Disturb)", NotificationManager.IMPORTANCE_HIGH)
+            pd.setBypassDnd(true); nm.createNotificationChannel(pd)
+        }
         val a = NotificationChannel(CH_ALARM, "Wake-up alarm", NotificationManager.IMPORTANCE_HIGH)
         a.setSound(null, null); a.setBypassDnd(true)
         nm.createNotificationChannel(a)
@@ -125,6 +129,12 @@ object Core {
     fun send(c: Context, type: String, done: ((Boolean) -> Unit)? = null): String = postJson(c, JSONObject().put("t", type), done)
 
     fun postTo(topic: String, body: ByteArray): Boolean = rawPost(topic, body).first
+    fun postToErr(topic: String, body: ByteArray): String = try {
+        val r = rawPost(topic, body); if (r.first) "" else "Server refused it: " + r.second.take(80)
+    } catch (e: Exception) { "Can't reach ntfy.sh" }
+    fun politeChannel(c: Context): String = try {
+        if (c.getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) { channels(c); CH_POLITE_DND } else CH_POLITE
+    } catch (e: Exception) { CH_POLITE }
 
     fun watch(id: String, cb: (Boolean) -> Unit) { synchronized(waiters) { waiters[id] = cb } }
     fun delivered(c: Context, id: String, dnd: Boolean) {
@@ -430,16 +440,16 @@ class WakeTile : TileService() {
 
 // ---------- Listener service ----------
 class ListenService : Service() {
-    companion object { @Volatile var running = false }
+    companion object { @Volatile var running = false; @Volatile var poller: (() -> String)? = null }
     private var started = false
-    override fun onDestroy() { running = false; super.onDestroy() }
+    override fun onDestroy() { running = false; poller = null; super.onDestroy() }
     override fun onBind(i: Intent?): IBinder? = null
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
         Core.channels(this)
         val n = Notification.Builder(this, Core.CH_SVC).setSmallIcon(Core.ICON).setContentTitle("WakeUp").setShowWhen(false).setVisibility(Notification.VISIBILITY_SECRET).build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(1, n)
-        running = true
+        running = true; poller = { pollOnce() }
         if (!started) {
             started = true
             Thread { loop("mine", "") { m, a -> handle(m, a) } }.start()
@@ -481,22 +491,55 @@ class ListenService : Service() {
             when (t) {
                 "wake" -> if (age > 600) Core.info(this, "Missed wake-up", "A wake-up arrived ${age / 60} min late, so the alarm was skipped")
                           else { Core.freshWake(this); Alarm.start(this) }
-                "polite" -> Core.withReply(this, Core.CH_POLITE, "Are you awake?", "Your partner is checking on you", "Yesh", "yesh")
-                "meow" -> Core.withReply(this, Core.CH_INFO, "Nyaaa", "Your partner says nyaaa", "Meowww", "meowr")
+                "polite" -> Core.withReply(this, Core.politeChannel(this), "Are you awake?", "Your partner is checking on you", "Yesh", "yesh")
+                "meow" -> Core.withReply(this, Core.CH_INFO, "Nyaaa", "", "Meowww", "meowr")
                 "yesh" -> Core.info(this, "Yesh", "They're awake")
-                "meowr" -> Core.info(this, "Meowww", "Your partner meowed back")
+                "meowr" -> Core.info(this, "Meowww", "")
                 "ack" -> Core.info(this, "They're up", "Your partner confirmed they're awake")
                 "late" -> Core.info(this, "Still asleep", "They haven't confirmed they're up. Tap to wake them!")
             }
         }
     }
 
-    private fun handleMacro(m: JSONObject) {
-        if (m.optString("t") != "nlog") return
-        try {
-            val txt = GZIPInputStream(java.io.ByteArrayInputStream(Base64.decode(m.getString("z"), Base64.NO_WRAP))).bufferedReader().readText()
-            MacroLog.append(this, JSONArray(txt))
-        } catch (e: Exception) {}
+    private fun handleMacro(m: JSONObject): Boolean {
+        if (m.optString("t") != "nlog") return false
+        return try {
+            if (!MacroLog.firstTime(this, m.optString("id"))) false
+            else {
+                val txt = GZIPInputStream(java.io.ByteArrayInputStream(Base64.decode(m.getString("z"), Base64.NO_WRAP))).bufferedReader().readText()
+                MacroLog.append(this, JSONArray(txt)); true
+            }
+        } catch (e: Exception) { false }
+    }
+
+    private fun pollOnce(): String {
+        val p = Core.prefs(this)
+        val topic = p.getString("mine", "")!!
+        if (topic.isEmpty()) return "No code set"
+        return try {
+            val since = System.currentTimeMillis() / 1000 - 43200
+            val h = URL("https://ntfy.sh/$topic/json?poll=1&since=$since").openConnection() as HttpURLConnection
+            h.connectTimeout = 15000; h.readTimeout = 30000
+            var logs = 0; var fresh = 0
+            h.inputStream.bufferedReader().forEachLine { line ->
+                try {
+                    val o = JSONObject(line)
+                    if (o.optString("event") == "message") {
+                        val m = JSONObject(o.getString("message"))
+                        if (m.optString("t") == "nlog") { logs++; if (handleMacro(m)) fresh++ }
+                        else {
+                            val tm = o.optLong("time"); val id = o.optString("id"); val lt = p.getLong("lastT", 0L)
+                            if (tm > lt || (tm == lt && id != p.getString("lastId", ""))) {
+                                p.edit().putLong("lastT", tm).putString("lastId", id).apply()
+                                val age = System.currentTimeMillis() / 1000 - tm
+                                if (age < 21600) handle(m, age)
+                            }
+                        }
+                    }
+                } catch (e: Exception) {}
+            }
+            if (logs == 0) "Nothing from the macro phone on the server yet" else "$fresh new, $logs found on the server"
+        } catch (e: Exception) { "Can't reach ntfy.sh" }
     }
 
     private fun loop(key: String, sfx: String, cb: (JSONObject, Long) -> Unit) {
@@ -619,16 +662,16 @@ object NotifForward {
     @Synchronized fun busy(): Boolean { val cut = System.currentTimeMillis() - 3600000L; sent.removeAll { it < cut }; return sent.size > 60 }
     @Synchronized fun flushNow(c: Context): Boolean {
         val p = Core.prefs(c); val target = p.getString("theirs", "")!!.trim()
-        if (target.isEmpty()) return true
+        if (target.isEmpty()) { p.edit().putString("nf_err", "Add your main phone's code as Partner's code").apply(); return true }
         while (true) {
             val es = MacroQueue.peek(c, 80); if (es.isEmpty()) return true
             val arr = JSONArray(); var best = ""; var n = 0
             for (e in es) { arr.put(e); val z = gz(arr.toString()); if (z.length > 3000) break; best = z; n++ }
             if (n == 0) { MacroQueue.drop(c, 1); continue }
-            val body = JSONObject().put("t", "nlog").put("z", best).put("n", n).toString().toByteArray()
-            val ok = try { Core.postTo(target, body) } catch (e: Exception) { false }
-            if (!ok) return false
-            MacroQueue.drop(c, n); p.edit().putLong("nf_last", System.currentTimeMillis()).apply(); sent.add(System.currentTimeMillis())
+            val body = JSONObject().put("t", "nlog").put("id", Core.rid()).put("z", best).put("n", n).toString().toByteArray()
+            val err = Core.postToErr(target, body)
+            if (err.isNotEmpty()) { p.edit().putString("nf_err", err).apply(); return false }
+            MacroQueue.drop(c, n); p.edit().putLong("nf_last", System.currentTimeMillis()).putString("nf_err", "").apply(); sent.add(System.currentTimeMillis())
             Thread.sleep(1500)
         }
     }
@@ -693,6 +736,14 @@ object MacroLog {
             if (f(c).length() > 8_000_000) { val l = f(c).readLines(); f(c).writeText(l.takeLast(l.size / 2).joinToString("\n") + "\n") }
         } catch (e: Exception) {}
         Handler(Looper.getMainLooper()).post { Hooks.onMacro?.invoke() }
+    }
+    @Synchronized fun firstTime(c: Context, id: String): Boolean {
+        if (id.isEmpty()) return true
+        val p = Core.prefs(c)
+        val l = (p.getString("ml_seen", "") ?: "").split(",").filter { it.isNotEmpty() }.toMutableList()
+        if (l.contains(id)) return false
+        l.add(id); p.edit().putString("ml_seen", l.takeLast(300).joinToString(",")).apply()
+        return true
     }
     fun query(c: Context, q: String, app: String): List<JSONObject> {
         val out = ArrayList<JSONObject>(); val ls = lines(c); var i = ls.size - 1
@@ -1116,6 +1167,7 @@ class MainActivity : Base() {
     private lateinit var musicLbl: TextView
     private lateinit var stopLbl: TextView
     private lateinit var mlLbl: TextView
+    private var mlNote = ""
     private var permDlg: Dialog? = null
     private var permRows: (() -> Unit)? = null
     private lateinit var dndBtn: Button
@@ -1135,7 +1187,7 @@ class MainActivity : Base() {
     }
     override fun onPause() { saveGrace(); saveCodes(); draw.saveLocal(); Backup.save(this); if (!BuildConfig.MACRO) Backup.saveLog(this); super.onPause() }
     override fun onDestroy() { Hooks.onLog = null; Board.view = null; ui.removeCallbacksAndMessages(null); super.onDestroy() }
-    override fun onResume() { super.onResume(); refreshDnd(); updateNf(); autoRestore(); permRows?.invoke() }
+    override fun onResume() { super.onResume(); Core.channels(this); refreshDnd(); updateNf(); autoRestore(); permRows?.invoke() }
 
     private fun updateTabs(tabs: List<ImageView>, pos: Float) {
         tabs.forEachIndexed { i, v ->
@@ -1433,9 +1485,27 @@ class MainActivity : Base() {
     private fun updateNf() {
         if (!::mlLbl.isInitialized) return
         val p = Core.prefs(this)
-        val last = p.getLong("ml_last", 0L)
         val f = java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.getDefault())
-        mlLbl.text = "Logged: " + p.getInt("ml_count", 0) + "\nLast received: " + (if (last == 0L) "never" else f.format(java.util.Date(last)))
+        val txt = if (!BuildConfig.MACRO) {
+            val last = p.getLong("ml_last", 0L)
+            "Logged: " + p.getInt("ml_count", 0) + "\nLast received: " + (if (last == 0L) "never" else f.format(java.util.Date(last)))
+        } else {
+            val en = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true
+            val last = p.getLong("nf_last", 0L); val err = p.getString("nf_err", "") ?: ""
+            (if (!en) "Notification access is off\n" else "") + "Queued: " + MacroQueue.size(this) + "\nLast sent: " +
+                (if (last == 0L) "never" else f.format(java.util.Date(last))) + (if (err.isNotEmpty()) "\nError: $err" else "")
+        }
+        mlLbl.text = txt + (if (mlNote.isNotEmpty()) "\n" + mlNote else "")
+    }
+    private fun checkNow() {
+        mlNote = "Checking..."; updateNf()
+        Thread {
+            val r = if (BuildConfig.MACRO) {
+                val ok = try { NotifForward.flushNow(applicationContext) } catch (e: Exception) { false }
+                if (ok) "Done" else "Couldn't send"
+            } else (ListenService.poller?.invoke() ?: "The listener isn't running. Reopen the app.")
+            ui.post { mlNote = r; updateNf() }
+        }.start()
     }
     private fun autoRestore() {
         if (Backup.available() && Backup.hasFile() && !Core.prefs(this).getBoolean("bk_ok", false)) {
@@ -1476,8 +1546,8 @@ class MainActivity : Base() {
         if (BuildConfig.MACRO) add("Notification access", "Allow", { Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true }) {
             try { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) } catch (e: Exception) {}
         }
-        add("Override Do Not Disturb", "Open", { try { getSystemService(NotificationManager::class.java).getNotificationChannel(Core.CH_POLITE)?.canBypassDnd() == true } catch (e: Exception) { false } }) {
-            try { startActivity(Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName).putExtra(Settings.EXTRA_CHANNEL_ID, Core.CH_POLITE)) } catch (e: Exception) {}
+        add("Override Do Not Disturb", "Allow", { try { getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted } catch (e: Exception) { false } }) {
+            try { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) } catch (e: Exception) {}
         }
         add("Restore history", "Restore", null) {
             val ok = Backup.available()
@@ -1538,10 +1608,9 @@ class MainActivity : Base() {
             row(btn("Choose app", true) { pickApp() }, btn("Usage access", false) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }),
             tv("Usage access lets the app notice you opened it. Without it, the alarm stops when you tap the Open button.", 12f, t.sub)), 14)
         col.put(card(sec("THEME"), tScroll), 14)
-        if (!BuildConfig.MACRO) {
-            mlLbl = tv("", 15f, t.text); updateNf()
-            col.put(card(mlLbl, btn("Open log", true) { startActivity(Intent(this, MacroLogActivity::class.java)) }), 14)
-        }
+        mlLbl = tv("", 15f, t.text); updateNf()
+        if (!BuildConfig.MACRO) col.put(card(mlLbl, row(btn("Check now", false) { checkNow() }, btn("Open log", true) { startActivity(Intent(this, MacroLogActivity::class.java)) })), 14)
+        else col.put(card(mlLbl, btn("Check now", true) { checkNow() }), 14)
         col.put(btn("Permissions", false) { showPerms() }, 14)
         sScroll.addView(col)
         val y = keepY; val x = keepX; keepY = 0; keepX = 0
