@@ -77,7 +77,7 @@ val THEMES = listOf(
 
 // ---------- Core ----------
 object Core {
-    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"; const val CH_POLITE_DND = "polite_dnd"
+    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"; const val CH_POLITE_DND = "polite_dnd"; const val CH_MACRO = "macro"
     val ICON = R.drawable.ic_alarm
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
     private val waiters = HashMap<String, (Boolean) -> Unit>()
@@ -90,6 +90,7 @@ object Core {
         try { nm.deleteNotificationChannel("quiet") } catch (e: Exception) {}
         nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_MIN))
         nm.createNotificationChannel(NotificationChannel(CH_INFO, "Messages", NotificationManager.IMPORTANCE_HIGH))
+        nm.createNotificationChannel(NotificationChannel(CH_MACRO, "Macro phone", NotificationManager.IMPORTANCE_DEFAULT))
         val po = NotificationChannel(CH_POLITE, "Are you awake?", NotificationManager.IMPORTANCE_HIGH)
         po.setBypassDnd(true); nm.createNotificationChannel(po)
         if (nm.isNotificationPolicyAccessGranted) {
@@ -132,6 +133,27 @@ object Core {
     fun postToErr(topic: String, body: ByteArray): String = try {
         val r = rawPost(topic, body); if (r.first) "" else "Server refused it: " + r.second.take(80)
     } catch (e: Exception) { "Can't reach ntfy.sh" }
+    fun macroNotify(c: Context, a: JSONArray) {
+        if (!prefs(c).getBoolean("ml_notify", false) || dndOn(c)) return
+        val nm = c.getSystemService(NotificationManager::class.java)
+        val open = PendingIntent.getActivity(c, 0, Intent(c, MacroLogActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val now = System.currentTimeMillis()
+        val fresh = ArrayList<JSONObject>()
+        for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (now - o.optLong("ts") < 600000) fresh.add(o) }
+        val show = fresh.takeLast(15)
+        for ((k, o) in show.withIndex()) {
+            val title = o.optString("app") + (if (o.optString("title").isNotEmpty()) " · " + o.optString("title") else "")
+            val body = o.optString("text")
+            val n = Notification.Builder(c, CH_MACRO).setSmallIcon(ICON).setContentTitle(title).setContentText(body)
+                .setStyle(Notification.BigTextStyle().bigText(body)).setContentIntent(open).setAutoCancel(true).setWhen(o.optLong("ts")).build()
+            nm.notify((now % 1000000).toInt() + 1000 + k, n)
+        }
+        if (fresh.size > show.size) {
+            val n = Notification.Builder(c, CH_MACRO).setSmallIcon(ICON).setContentTitle("Macro phone").setContentText("+" + (fresh.size - show.size) + " more in the log")
+                .setContentIntent(open).setAutoCancel(true).build()
+            nm.notify(999, n)
+        }
+    }
     fun politeChannel(c: Context): String = try {
         if (c.getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) { channels(c); CH_POLITE_DND } else CH_POLITE
     } catch (e: Exception) { CH_POLITE }
@@ -507,7 +529,7 @@ class ListenService : Service() {
             if (!MacroLog.firstTime(this, m.optString("id"))) false
             else {
                 val txt = GZIPInputStream(java.io.ByteArrayInputStream(Base64.decode(m.getString("z"), Base64.NO_WRAP))).bufferedReader().readText()
-                MacroLog.append(this, JSONArray(txt)); true
+                val arr = JSONArray(txt); MacroLog.append(this, arr); Core.macroNotify(this, arr); true
             }
         } catch (e: Exception) { false }
     }
@@ -1327,19 +1349,14 @@ class MainActivity : Base() {
         preview = ImageView(this).apply { scaleType = ImageView.ScaleType.CENTER_CROP; visibility = View.GONE }
         val add = btn("Add photo", false) { startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 8) }
         val rem = btn("Remove photo", false) { img = null; preview.visibility = View.GONE }
-        val clearSw = sw("Clear boxes after sending", p.getBoolean("clear_after", false)) { v -> p.edit().putBoolean("clear_after", v).apply() }
+        val clearBtn = btn("Clear", false) { tField.setText(""); bField.setText(""); nStatus.text = "" }
         val send = btn("Send", true) {
             val ti = tField.text.toString().trim(); val bo = bField.text.toString().trim()
             if (p.getString("theirs", "").isNullOrBlank()) nStatus.text = "Add your partner's code in Settings"
             else if (ti.isEmpty() && bo.isEmpty() && img == null) nStatus.text = "Write something or add a photo first"
             else {
                 nStatus.text = "Sending..."
-                val id = Core.sendCustom(this, ti, bo, img) { ok ->
-                    if (ok) {
-                        sentText(nStatus)
-                        if (p.getBoolean("clear_after", false)) { tField.setText(""); bField.setText(""); img = null; preview.visibility = View.GONE }
-                    } else nStatus.text = "Couldn't send. Check your connection"
-                }
+                val id = Core.sendCustom(this, ti, bo, img) { ok -> if (ok) sentText(nStatus) else nStatus.text = "Couldn't send. Check your connection" }
                 track(nStatus, id)
             }
         }
@@ -1354,7 +1371,7 @@ class MainActivity : Base() {
         tplBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(dpi(20), dpi(40), dpi(20), dpi(16)) }
         col.put(tv("Custom notification", 28f, t.text, true), 0)
-        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), clearSw, nStatus, send, save), 16)
+        col.put(card(sec("TITLE"), tField, sec("MESSAGE"), bField, preview, row(add, rem), nStatus, send, save, clearBtn), 16)
         preview.layoutParams = (preview.layoutParams as LinearLayout.LayoutParams).apply { height = dpi(180) }
         col.put(card(sec("TEMPLATES"), tplBox), 14)
         col.put(tv("Photos are sent through ntfy.sh and stay available for about 3 hours. Templates save text only.", 12f, t.sub), 10)
@@ -1608,9 +1625,11 @@ class MainActivity : Base() {
             row(btn("Choose app", true) { pickApp() }, btn("Usage access", false) { startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS)) }),
             tv("Usage access lets the app notice you opened it. Without it, the alarm stops when you tap the Open button.", 12f, t.sub)), 14)
         col.put(card(sec("THEME"), tScroll), 14)
-        mlLbl = tv("", 15f, t.text); updateNf()
-        if (!BuildConfig.MACRO) col.put(card(mlLbl, row(btn("Check now", false) { checkNow() }, btn("Open log", true) { startActivity(Intent(this, MacroLogActivity::class.java)) })), 14)
-        else col.put(card(mlLbl, btn("Check now", true) { checkNow() }), 14)
+        if (!BuildConfig.MACRO) {
+            mlLbl = tv("", 15f, t.text); updateNf()
+            col.put(card(mlLbl, sw("Also show as notifications", p.getBoolean("ml_notify", false)) { v -> p.edit().putBoolean("ml_notify", v).apply() },
+                row(btn("Check now", false) { checkNow() }, btn("Open log", true) { startActivity(Intent(this, MacroLogActivity::class.java)) })), 14)
+        }
         col.put(btn("Permissions", false) { showPerms() }, 14)
         sScroll.addView(col)
         val y = keepY; val x = keepX; keepY = 0; keepX = 0
