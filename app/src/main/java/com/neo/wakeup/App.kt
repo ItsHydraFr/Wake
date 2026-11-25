@@ -25,6 +25,8 @@ import android.graphics.drawable.LayerDrawable
 import android.graphics.drawable.Icon
 import android.graphics.drawable.RippleDrawable
 import android.media.*
+import android.net.ConnectivityManager
+import android.net.Network
 import android.net.Uri
 import android.os.*
 import android.provider.Settings
@@ -77,10 +79,20 @@ val THEMES = listOf(
 
 // ---------- Core ----------
 object Core {
-    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "bg"; const val CH_POLITE = "polite"; const val CH_POLITE_DND = "polite_dnd"; const val CH_MACRO = "macro"
+    const val CH_ALARM = "alarm"; const val CH_INFO = "info"; const val CH_SVC = "run"; const val CH_POLITE = "polite"; const val CH_POLITE_DND = "polite_dnd"; const val CH_MACRO = "macro"
     val ICON = R.drawable.ic_alarm
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
     private val waiters = HashMap<String, (Boolean) -> Unit>()
+    @Volatile var lastErr = ""
+    fun whyFailed(): String {
+        val e = lastErr
+        return when {
+            e == "HTTP 429" -> "ntfy.sh says too many messages (rate limit). Wait a few minutes."
+            e.startsWith("HTTP") -> "ntfy.sh error ($e)."
+            e.startsWith("net:") -> "can't reach ntfy.sh (" + e.removePrefix("net:") + "). It may be blocked or slow on this network."
+            else -> "check your connection."
+        }
+    }
     fun rid(): String = (1..8).map { "abcdefghijklmnopqrstuvwxyz0123456789".random() }.joinToString("")
     fun dndOn(c: Context): Boolean = System.currentTimeMillis() < prefs(c).getLong("dnd_until", 0L)
 
@@ -88,7 +100,8 @@ object Core {
         val nm = c.getSystemService(NotificationManager::class.java)
         try { nm.deleteNotificationChannel("svc") } catch (e: Exception) {}
         try { nm.deleteNotificationChannel("quiet") } catch (e: Exception) {}
-        nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_MIN))
+        try { nm.deleteNotificationChannel("bg") } catch (e: Exception) {}
+        nm.createNotificationChannel(NotificationChannel(CH_SVC, "Background listening", NotificationManager.IMPORTANCE_LOW))
         nm.createNotificationChannel(NotificationChannel(CH_INFO, "Messages", NotificationManager.IMPORTANCE_HIGH))
         nm.createNotificationChannel(NotificationChannel(CH_MACRO, "Macro phone", NotificationManager.IMPORTANCE_DEFAULT))
         val po = NotificationChannel(CH_POLITE, "Are you awake?", NotificationManager.IMPORTANCE_HIGH)
@@ -108,6 +121,7 @@ object Core {
         if (fname != null) h.setRequestProperty("Filename", fname)
         h.outputStream.use { it.write(body) }
         val code = h.responseCode
+        lastErr = if (code == 200) "" else "HTTP $code"
         val txt = try { (if (code == 200) h.inputStream else h.errorStream).bufferedReader().readText() } catch (e: Exception) { "" }
         h.disconnect()
         return Pair(code == 200, txt)
@@ -121,7 +135,7 @@ object Core {
         Thread {
             var ok = false
             if (track) log(c, 0, describe(o), id, 0)
-            try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) {}
+            try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
             if (track && !ok) mark(c, id, 2)
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
@@ -133,6 +147,20 @@ object Core {
     fun postToErr(topic: String, body: ByteArray): String = try {
         val r = rawPost(topic, body); if (r.first) "" else "Server refused it: " + r.second.take(80)
     } catch (e: Exception) { "Can't reach ntfy.sh" }
+    fun armWatchdog(c: Context, ms: Long = 120000L) {
+        try {
+            val am = c.getSystemService(AlarmManager::class.java)
+            val pi = PendingIntent.getBroadcast(c, 9, Intent(c, WatchdogReceiver::class.java), PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+            val at = System.currentTimeMillis() + ms
+            if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()) am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+            else am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pi)
+        } catch (e: Exception) {}
+    }
+    fun infoId(c: Context, id: Int, title: String, text: String) {
+        val pi = PendingIntent.getActivity(c, 0, Intent(c, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val n = Notification.Builder(c, CH_INFO).setSmallIcon(ICON).setContentTitle(title).setContentText(text).setContentIntent(pi).setAutoCancel(true).build()
+        c.getSystemService(NotificationManager::class.java).notify(id, n)
+    }
     fun macroNotify(c: Context, a: JSONArray) {
         if (!prefs(c).getBoolean("ml_notify", false) || dndOn(c)) return
         val nm = c.getSystemService(NotificationManager::class.java)
@@ -187,7 +215,7 @@ object Core {
                     o.put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
                 }
                 ok = rawPost(t, o.toString().toByteArray()).first
-            } catch (e: Exception) {}
+            } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
             if (!ok) mark(c, id, 2)
             Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
@@ -208,7 +236,7 @@ object Core {
                     val o = JSONObject().put("t", "board").put("id", id).put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
                     ok = rawPost(t, o.toString().toByteArray()).first
                 }
-            } catch (e: Exception) {}
+            } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
             if (!ok) mark(c, id, 2)
             Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
@@ -379,7 +407,7 @@ object Alarm {
             m.setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
             mp = m
-            m.setDataSource(a, uri); m.isLooping = true; m.setVolume(vol, vol); m.prepare(); m.start()
+            m.setWakeMode(a, PowerManager.PARTIAL_WAKE_LOCK); m.setDataSource(a, uri); m.isLooping = true; m.setVolume(vol, vol); m.prepare(); m.start()
         } catch (e: Exception) {}
         try {
             vib = a.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
@@ -416,7 +444,7 @@ class SnoozeReceiver : BroadcastReceiver() {
 
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
-        c.startForegroundService(Intent(c, ListenService::class.java)); Core.scheduleNext(c)
+        c.startForegroundService(Intent(c, ListenService::class.java)); Core.scheduleNext(c); Core.armWatchdog(c)
     }
 }
 
@@ -462,31 +490,50 @@ class WakeTile : TileService() {
 
 // ---------- Listener service ----------
 class ListenService : Service() {
-    companion object { @Volatile var running = false; @Volatile var poller: (() -> String)? = null }
+    companion object { @Volatile var running = false; @Volatile var poller: ((Boolean) -> String)? = null; @Volatile var conn: HttpURLConnection? = null; @Volatile var alive = false }
     private var started = false
-    override fun onDestroy() { running = false; poller = null; super.onDestroy() }
+    override fun onDestroy() { running = false; poller = null; Core.armWatchdog(this, 5000L); super.onDestroy() }
+    override fun onTaskRemoved(i: Intent?) { Core.armWatchdog(this, 5000L); super.onTaskRemoved(i) }
+    private var netCb = false
+    private fun watchNetwork() {
+        if (netCb) return
+        try {
+            val cm = getSystemService(ConnectivityManager::class.java)
+            cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(n: Network) { Thread { try { conn?.disconnect() } catch (e: Exception) {} }.start() }
+            })
+            netCb = true
+        } catch (e: Exception) {}
+    }
     override fun onBind(i: Intent?): IBinder? = null
     override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
         Core.channels(this)
-        val n = Notification.Builder(this, Core.CH_SVC).setSmallIcon(Core.ICON).setContentTitle("WakeUp").setShowWhen(false).setVisibility(Notification.VISIBILITY_SECRET).build()
+        val n = Notification.Builder(this, Core.CH_SVC).setSmallIcon(Core.ICON).setContentTitle("WakeUp is running").setContentText("Listening for wake-ups").setOngoing(true).setCategory(Notification.CATEGORY_SERVICE).build()
         if (Build.VERSION.SDK_INT >= 34) startForeground(1, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
         else startForeground(1, n)
-        running = true; poller = { pollOnce() }
+        running = true; poller = { deep -> pollOnce(deep) }; Core.armWatchdog(this); watchNetwork()
         if (!started) {
             started = true
-            Thread { loop("mine", "") { m, a -> handle(m, a) } }.start()
+            Thread { Core.log(this, 2, "Listener started") }.start()
+            Thread {
+                alive = true
+                try { loop("mine", "") { m, a -> handle(m, a) } }
+                catch (e: Throwable) { Core.log(this, 2, "Listener crashed: " + e.javaClass.simpleName) }
+                finally { alive = false; started = false }
+            }.start()
         }
         return START_STICKY
     }
 
     private fun handle(m: JSONObject, age: Long) {
         val t = m.optString("t")
+        try { getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "wakeup:msg").acquire(20000L) } catch (e: Exception) {}
         if (t == "dlv") { Core.delivered(this, m.optString("ref"), m.optBoolean("dnd")); return }
         if (t == "nlog") { if (!BuildConfig.MACRO) handleMacro(m); return }
         val dnd = Core.dndOn(this)
         val id = m.optString("id")
         if (id.isNotEmpty()) Core.postJson(this, JSONObject().put("t", "dlv").put("ref", id).put("dnd", dnd), null, false)
-        Core.log(this, 1, Core.describe(m) + (if (age > 600 && t == "wake") " (arrived late)" else ""), "", if (dnd && t != "board") 4 else 0)
+        Core.log(this, 1, Core.describe(m) + (if (age > 900 && t == "wake") " (arrived late)" else ""), "", if (dnd && t != "board") 4 else 0)
         val ui = Handler(Looper.getMainLooper())
         if (t == "board") {
             Thread {
@@ -510,8 +557,9 @@ class ListenService : Service() {
             return
         }
         ui.post {
+          try {
             when (t) {
-                "wake" -> if (age > 600) Core.info(this, "Missed wake-up", "A wake-up arrived ${age / 60} min late, so the alarm was skipped")
+                "wake" -> if (age > 900) Core.infoId(this, 3, "Missed wake-up", "A wake-up arrived ${age / 60} min late, so the alarm was skipped")
                           else { Core.freshWake(this); Alarm.start(this) }
                 "polite" -> Core.withReply(this, Core.politeChannel(this), "Are you awake?", "Your partner is checking on you", "Yesh", "yesh")
                 "meow" -> Core.withReply(this, Core.CH_INFO, "Nyaaa", "", "Meowww", "meowr")
@@ -520,6 +568,7 @@ class ListenService : Service() {
                 "ack" -> Core.info(this, "They're up", "Your partner confirmed they're awake")
                 "late" -> Core.info(this, "Still asleep", "They haven't confirmed they're up. Tap to wake them!")
             }
+          } catch (e: Throwable) { Core.log(this, 2, "Error: " + e.javaClass.simpleName) }
         }
     }
 
@@ -534,32 +583,35 @@ class ListenService : Service() {
         } catch (e: Exception) { false }
     }
 
-    private fun pollOnce(): String {
+    private fun pollOnce(deep: Boolean): String {
         val p = Core.prefs(this)
         val topic = p.getString("mine", "")!!
         if (topic.isEmpty()) return "No code set"
         return try {
-            val since = System.currentTimeMillis() / 1000 - 43200
+            val last0 = p.getLong("lastT", 0L)
+            val since = if (deep || last0 == 0L) System.currentTimeMillis() / 1000 - 43200 else last0 - 60
             val h = URL("https://ntfy.sh/$topic/json?poll=1&since=$since").openConnection() as HttpURLConnection
             h.connectTimeout = 15000; h.readTimeout = 30000
-            var logs = 0; var fresh = 0
+            h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
+            var logs = 0; var fresh = 0; var rec = 0
             h.inputStream.bufferedReader().forEachLine { line ->
                 try {
                     val o = JSONObject(line)
                     if (o.optString("event") == "message") {
                         val m = JSONObject(o.getString("message"))
-                        if (m.optString("t") == "nlog") { logs++; if (handleMacro(m)) fresh++ }
+                        if (m.optString("t") == "nlog") { logs++; if (handleMacro(m)) { fresh++; rec++ } }
                         else {
                             val tm = o.optLong("time"); val id = o.optString("id"); val lt = p.getLong("lastT", 0L)
                             if (tm > lt || (tm == lt && id != p.getString("lastId", ""))) {
                                 p.edit().putLong("lastT", tm).putString("lastId", id).apply()
                                 val age = System.currentTimeMillis() / 1000 - tm
-                                if (age < 21600) handle(m, age)
+                                if (age < 21600) { handle(m, age); rec++ }
                             }
                         }
                     }
                 } catch (e: Exception) {}
             }
+            if (!deep && rec > 0) Core.log(this, 2, "Catch-up recovered $rec message(s)")
             if (logs == 0) "Nothing from the macro phone on the server yet" else "$fresh new, $logs found on the server"
         } catch (e: Exception) { "Can't reach ntfy.sh" }
     }
@@ -573,7 +625,8 @@ class ListenService : Service() {
                 val last = p.getLong("lastT$sfx", 0L)
                 val since = if (last > 0) last else System.currentTimeMillis() / 1000 - 7200
                 val h = URL("https://ntfy.sh/$topic/json?since=$since").openConnection() as HttpURLConnection
-                h.readTimeout = 120000
+                h.readTimeout = 120000; h.connectTimeout = 20000; conn = h
+                h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
                 h.inputStream.bufferedReader().forEachLine { line ->
                     if (Core.prefs(this).getString(key, "") != topic) throw RuntimeException("code changed")
                     p.edit().putLong("hb$sfx", System.currentTimeMillis()).apply()
@@ -588,11 +641,19 @@ class ListenService : Service() {
                                 if (age < 21600) cb(JSONObject(o.getString("message")), age)
                             }
                         }
-                    } catch (e: Exception) {}
+                    } catch (e: Throwable) {}
                 }
-            } catch (e: Exception) {}
+            } catch (e: Throwable) {}
             Thread.sleep(5000)
         }
+    }
+}
+
+class WatchdogReceiver : BroadcastReceiver() {
+    override fun onReceive(c: Context, i: Intent) {
+        Core.armWatchdog(c)
+        if (!ListenService.running || !ListenService.alive) { try { c.startForegroundService(Intent(c, ListenService::class.java)) } catch (e: Exception) {} }
+        else { val pr = goAsync(); Thread { try { ListenService.poller?.invoke(false) } catch (e: Exception) {}; pr.finish() }.start() }
     }
 }
 
@@ -659,6 +720,8 @@ object Backup {
 }
 
 // ---------- Macro phone: capture + forward ----------
+val IGNORED_PKGS = setOf("com.spotify.music", "com.spotify.lite")
+
 object MacroQueue {
     private fun f(c: Context) = java.io.File(c.filesDir, "nq.jsonl")
     @Synchronized fun add(c: Context, o: JSONObject) {
@@ -724,9 +787,9 @@ class NotifCapture : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (!BuildConfig.MACRO) return
         val p = Core.prefs(this)
-        if (!p.getBoolean("nf_on", true) || sbn.packageName == packageName) return
+        if (!p.getBoolean("nf_on", true) || sbn.packageName == packageName || sbn.packageName in IGNORED_PKGS) return
         val n = sbn.notification
-        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0) return
+        if (n.flags and Notification.FLAG_GROUP_SUMMARY != 0 || n.category == Notification.CATEGORY_TRANSPORT) return
         val ex = n.extras
         val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString() ?: ""
         val text = ex.getCharSequence(Notification.EXTRA_TEXT)?.toString() ?: ""
@@ -752,9 +815,10 @@ object MacroLog {
     @Synchronized private fun lines(c: Context): List<String> = try { f(c).readLines() } catch (e: Exception) { emptyList() }
     @Synchronized fun append(c: Context, a: JSONArray) {
         try {
-            f(c).appendText(buildString { for (i in 0 until a.length()) append(a.getJSONObject(i).toString()).append('\n') })
+            var kept = 0
+            f(c).appendText(buildString { for (i in 0 until a.length()) { val o = a.getJSONObject(i); if (o.optString("pkg") !in IGNORED_PKGS) { append(o.toString()).append('\n'); kept++ } } })
             val p = Core.prefs(c)
-            p.edit().putInt("ml_count", p.getInt("ml_count", 0) + a.length()).putLong("ml_last", System.currentTimeMillis()).apply()
+            p.edit().putInt("ml_count", p.getInt("ml_count", 0) + kept).putLong("ml_last", System.currentTimeMillis()).apply()
             if (f(c).length() > 8_000_000) { val l = f(c).readLines(); f(c).writeText(l.takeLast(l.size / 2).joinToString("\n") + "\n") }
         } catch (e: Exception) {}
         Handler(Looper.getMainLooper()).post { Hooks.onMacro?.invoke() }
@@ -767,17 +831,24 @@ object MacroLog {
         l.add(id); p.edit().putString("ml_seen", l.takeLast(300).joinToString(",")).apply()
         return true
     }
-    fun query(c: Context, q: String, app: String): List<JSONObject> {
+    fun query(c: Context, q: String, apps: Set<String>): List<JSONObject> {
         val out = ArrayList<JSONObject>(); val ls = lines(c); var i = ls.size - 1
         while (i >= 0 && out.size < 5000) {
             try {
                 val o = JSONObject(ls[i])
-                if ((app.isEmpty() || o.optString("app") == app) &&
+                if ((apps.isEmpty() || apps.contains(o.optString("app"))) &&
                     (q.isEmpty() || (o.optString("app") + " " + o.optString("title") + " " + o.optString("text")).lowercase().contains(q))) out.add(o)
             } catch (e: Exception) {}
             i--
         }
         return out
+    }
+    @Synchronized fun purge(c: Context) {
+        try {
+            val keep = lines(c).filter { l -> try { JSONObject(l).optString("pkg") !in IGNORED_PKGS } catch (e: Exception) { false } }
+            f(c).writeText(if (keep.isEmpty()) "" else keep.joinToString("\n") + "\n")
+            Core.prefs(c).edit().putInt("ml_count", keep.size).apply()
+        } catch (e: Exception) {}
     }
     fun apps(c: Context): List<String> =
         lines(c).mapNotNull { try { JSONObject(it).optString("app") } catch (e: Exception) { null } }.filter { it.isNotEmpty() }.distinct().sorted()
@@ -803,7 +874,8 @@ class MacroLogActivity : Base() {
     private lateinit var q: EditText
     private lateinit var appBtn: Button
     private lateinit var info: TextView
-    private var appFilter = ""
+    private var appFilter: Set<String> = emptySet()
+    private fun appLabel(x: Set<String>) = when { x.isEmpty() -> "Apps: All"; x.size == 1 -> "Apps: " + x.first(); else -> "Apps: ${x.size} selected" }
     private var matches: List<JSONObject> = emptyList()
     private var shown = 0
     private val ui = Handler(Looper.getMainLooper())
@@ -819,7 +891,8 @@ class MacroLogActivity : Base() {
                 override fun onTextChanged(s: CharSequence?, st: Int, bf: Int, ct: Int) {}
             })
         }
-        appBtn = btn("App: All", false) { pickApp() }
+        appFilter = Core.prefs(this).getStringSet("ml_apps", emptySet())?.toSet() ?: emptySet()
+        appBtn = btn(appLabel(appFilter), false) { pickApp() }
         info = tv("", 13f, t.sub)
         list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         val clear = btn("Clear log", false) {
@@ -854,13 +927,22 @@ class MacroLogActivity : Base() {
     }
     private fun pickApp() {
         Thread {
-            val names = listOf("All apps") + MacroLog.apps(this)
+            val names = MacroLog.apps(this)
             ui.post {
-                AlertDialog.Builder(this).setTitle("Filter by app").setItems(names.toTypedArray()) { _, i ->
-                    appFilter = if (i == 0) "" else names[i]; appBtn.text = if (i == 0) "App: All" else "App: " + names[i]; reload()
-                }.show()
+                val sel = BooleanArray(names.size) { appFilter.contains(names[it]) }
+                AlertDialog.Builder(this).setTitle("Show these apps")
+                    .setMultiChoiceItems(names.toTypedArray(), sel) { _, i, on -> sel[i] = on }
+                    .setPositiveButton("Apply") { _, _ -> applyApps(names.filterIndexed { i, _ -> sel[i] }.toSet()) }
+                    .setNeutralButton("All apps") { _, _ -> applyApps(emptySet()) }
+                    .setNegativeButton("Cancel", null).show()
             }
         }.start()
+    }
+    private fun applyApps(x: Set<String>) {
+        appFilter = x
+        Core.prefs(this).edit().putStringSet("ml_apps", x).apply()
+        appBtn.text = appLabel(x)
+        reload()
     }
     private fun export() {
         startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("text/csv").putExtra(Intent.EXTRA_TITLE, "macro-log.csv"), 31)
@@ -1209,7 +1291,7 @@ class MainActivity : Base() {
     }
     override fun onPause() { saveGrace(); saveCodes(); draw.saveLocal(); Backup.save(this); if (!BuildConfig.MACRO) Backup.saveLog(this); super.onPause() }
     override fun onDestroy() { Hooks.onLog = null; Board.view = null; ui.removeCallbacksAndMessages(null); super.onDestroy() }
-    override fun onResume() { super.onResume(); Core.channels(this); refreshDnd(); updateNf(); autoRestore(); permRows?.invoke() }
+    override fun onResume() { super.onResume(); Core.channels(this); Core.armWatchdog(this); refreshDnd(); updateNf(); autoRestore(); permRows?.invoke() }
 
     private fun updateTabs(tabs: List<ImageView>, pos: Float) {
         tabs.forEachIndexed { i, v ->
@@ -1230,6 +1312,7 @@ class MainActivity : Base() {
             val c = "abcdefghijkmnpqrstuvwxyz23456789"
             p.edit().putString("mine", "wake-" + (1..12).map { c.random() }.joinToString("")).apply()
         }
+        if (!BuildConfig.MACRO && !p.getBoolean("ml_purged1", false)) { p.edit().putBoolean("ml_purged1", true).apply(); Thread { MacroLog.purge(this) }.start() }
         val pages = listOf(drawPage(), notifyPage(), wakePage(p), histPage(), settingsPage(p))
         Hooks.onLog = { renderHist() }
 
@@ -1254,7 +1337,7 @@ class MainActivity : Base() {
         root.addView(col, FrameLayout.LayoutParams(-1, -1))
         show(root)
         keepPage = 2
-        if (!ListenService.running) startForegroundService(Intent(this, ListenService::class.java))
+        if (!ListenService.running || !ListenService.alive) startForegroundService(Intent(this, ListenService::class.java))
         ui.post(tick)
         if (!p.getBoolean("perm_seen", false)) { p.edit().putBoolean("perm_seen", true).apply(); ui.postDelayed({ showPerms() }, 700) }
     }
@@ -1309,7 +1392,7 @@ class MainActivity : Base() {
             if (Core.prefs(this).getString("theirs", "").isNullOrBlank()) status.text = "Saved here. Add your partner's code in Settings to sync."
             else {
                 status.text = "Sending..."
-                val id = Core.sendBoard(this, draw.snapshot()) { ok -> if (ok) sentText(status) else status.text = "Couldn't send. Check your connection" }
+                val id = Core.sendBoard(this, draw.snapshot()) { ok -> if (ok) sentText(status) else status.text = "Couldn't send: " + Core.whyFailed() }
                 track(status, id)
             }
         }
@@ -1356,7 +1439,7 @@ class MainActivity : Base() {
             else if (ti.isEmpty() && bo.isEmpty() && img == null) nStatus.text = "Write something or add a photo first"
             else {
                 nStatus.text = "Sending..."
-                val id = Core.sendCustom(this, ti, bo, img) { ok -> if (ok) sentText(nStatus) else nStatus.text = "Couldn't send. Check your connection" }
+                val id = Core.sendCustom(this, ti, bo, img) { ok -> if (ok) sentText(nStatus) else nStatus.text = "Couldn't send: " + Core.whyFailed() }
                 track(nStatus, id)
             }
         }
@@ -1417,7 +1500,7 @@ class MainActivity : Base() {
         fun go(type: String) {
             if (p.getString("theirs", "").isNullOrBlank()) { status.text = "Add your partner's code in Settings"; return }
             status.text = "Sending..."
-            val id = Core.send(this, type) { ok -> if (ok) sentText(status) else status.text = "Couldn't send. Check your connection" }
+            val id = Core.send(this, type) { ok -> if (ok) sentText(status) else status.text = "Couldn't send: " + Core.whyFailed() }
             track(status, id)
         }
         dndBtn = mini("DND", false) { dndDialog() }
@@ -1520,7 +1603,7 @@ class MainActivity : Base() {
             val r = if (BuildConfig.MACRO) {
                 val ok = try { NotifForward.flushNow(applicationContext) } catch (e: Exception) { false }
                 if (ok) "Done" else "Couldn't send"
-            } else (ListenService.poller?.invoke() ?: "The listener isn't running. Reopen the app.")
+            } else (ListenService.poller?.invoke(true) ?: "The listener isn't running. Reopen the app.")
             ui.post { mlNote = r; updateNf() }
         }.start()
     }
@@ -1540,18 +1623,31 @@ class MainActivity : Base() {
             stopLbl.text = stopText(pr)
         }.show()
     }
+    private fun oemIntent(): Intent? {
+        val m = Build.MANUFACTURER.lowercase()
+        val c: Pair<String, String>? = when {
+            m.contains("xiaomi") || m.contains("redmi") || m.contains("poco") -> Pair("com.miui.securitycenter", "com.miui.permcenter.autostart.AutoStartManagementActivity")
+            m.contains("oppo") || m.contains("realme") || m.contains("oneplus") -> Pair("com.coloros.safecenter", "com.coloros.safecenter.permission.startup.StartupAppListActivity")
+            m.contains("vivo") -> Pair("com.vivo.permissionmanager", "com.vivo.permissionmanager.activity.BgStartUpManagerActivity")
+            m.contains("huawei") || m.contains("honor") -> Pair("com.huawei.systemmanager", "com.huawei.systemmanager.startupmgr.ui.StartupNormalAppListActivity")
+            m.contains("samsung") -> Pair("com.samsung.android.lool", "com.samsung.android.sm.battery.ui.BatteryActivity")
+            else -> null
+        }
+        return c?.let { Intent().setComponent(ComponentName(it.first, it.second)) }
+    }
     private fun showPerms() {
         permDlg?.dismiss()
         val upd = ArrayList<() -> Unit>()
         val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         box.put(tv("Permissions", 22f, t.text, true).apply { gravity = Gravity.CENTER }, 0)
         fun add(label: String, btnLabel: String, granted: (() -> Boolean)?, action: () -> Unit) {
-            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
+            val line = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; setOnClickListener { action() } }
             val b = mini(btnLabel, true) { action() }
+            val st = tv("Allowed", 15f, t.ac1, true).apply { visibility = View.GONE }
             line.addView(tv(label, 15f, t.text), LinearLayout.LayoutParams(0, -2, 1f))
-            line.addView(b, LinearLayout.LayoutParams(-2, -2))
+            line.addView(b, LinearLayout.LayoutParams(-2, -2)); line.addView(st, LinearLayout.LayoutParams(-2, -2))
             box.put(line, 16)
-            if (granted != null) upd.add { val g = granted(); b.text = if (g) "Allowed" else btnLabel; b.isEnabled = !g; b.alpha = if (g) 0.5f else 1f }
+            if (granted != null) upd.add { val g = granted(); b.visibility = if (g) View.GONE else View.VISIBLE; st.visibility = if (g) View.VISIBLE else View.GONE }
         }
         val pm = getSystemService(PowerManager::class.java)
         add("Background running", "Allow", { try { pm.isIgnoringBatteryOptimizations(packageName) } catch (e: Exception) { false } }) {
@@ -1559,6 +1655,15 @@ class MainActivity : Base() {
         }
         add("File access", "Allow", { Backup.available() }) {
             try { startActivity(Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
+        }
+        add("Background data", "Allow", { try { getSystemService(ConnectivityManager::class.java).restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED } catch (e: Exception) { true } }) {
+            try { startActivity(Intent(Settings.ACTION_IGNORE_BACKGROUND_DATA_RESTRICTIONS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e: Exception) {}
+        }
+        val oem = oemIntent()
+        if (oem != null) add(if (Build.MANUFACTURER.lowercase().contains("samsung")) "Never sleeping apps (Samsung)" else "Autostart (" + Build.MANUFACTURER + ")", "Open", null) {
+            try { startActivity(oem) } catch (e: Exception) {
+                try { startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName"))) } catch (e2: Exception) {}
+            }
         }
         if (BuildConfig.MACRO) add("Notification access", "Allow", { Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true }) {
             try { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) } catch (e: Exception) {}
