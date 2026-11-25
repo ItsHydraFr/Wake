@@ -4,6 +4,7 @@ android{
  compileSdk=34
  defaultConfig{applicationId="com.neo.wakeup";minSdk=26;targetSdk=34;versionCode=1;versionName="1.0"}
  buildFeatures{buildConfig=true}
+ signingConfigs{getByName("debug"){storeFile=file("debug.keystore");storePassword="android";keyAlias="androiddebugkey";keyPassword="android"}}
  flavorDimensions += "role"
  productFlavors{
   create("personal"){dimension="role";buildConfigField("boolean","MACRO","false")}

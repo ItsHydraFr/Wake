@@ -135,7 +135,14 @@ object Core {
         Thread {
             var ok = false
             if (track) log(c, 0, describe(o), id, 0)
-            try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
+            var tries = 0
+            while (tries < 3 && !ok) {
+                try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
+                val retry = !ok && (lastErr == "HTTP 429" || lastErr.startsWith("net:") || lastErr.startsWith("HTTP 5"))
+                if (!retry) break
+                tries++
+                if (tries < 3) Thread.sleep(if (tries == 1) 2000L else 5000L)
+            }
             if (track && !ok) mark(c, id, 2)
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
         }.start()
@@ -612,7 +619,7 @@ class ListenService : Service() {
                 } catch (e: Exception) {}
             }
             if (!deep && rec > 0) Core.log(this, 2, "Catch-up recovered $rec message(s)")
-            if (logs == 0) "Nothing from the macro phone on the server yet" else "$fresh new, $logs found on the server"
+            if (logs == 0) "Nothing from the macro phone for this code. Check that its Partner's code matches your Your code." else "$fresh new, $logs found on the server"
         } catch (e: Exception) { "Can't reach ntfy.sh" }
     }
 
@@ -1668,6 +1675,7 @@ class MainActivity : Base() {
         if (BuildConfig.MACRO) add("Notification access", "Allow", { Settings.Secure.getString(contentResolver, "enabled_notification_listeners")?.contains(packageName) == true }) {
             try { startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) } catch (e: Exception) {}
         }
+        if (BuildConfig.MACRO) add("Main phone's code", "Enter", { !Core.prefs(this).getString("theirs", "").isNullOrBlank() }) { permDlg?.dismiss(); pager.goTo(4) }
         add("Override Do Not Disturb", "Allow", { try { getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted } catch (e: Exception) { false } }) {
             try { startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS)) } catch (e: Exception) {}
         }
