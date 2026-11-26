@@ -87,8 +87,8 @@ object Core {
     fun whyFailed(): String {
         val e = lastErr
         return when {
-            e == "HTTP 429" -> "ntfy.sh says too many messages (rate limit). Wait a few minutes."
-            e.startsWith("HTTP") -> "ntfy.sh error ($e)."
+            e.startsWith("HTTP 429") -> "ntfy.sh rate limit" + (e.substringAfter("|", "").let { if (it.isNotEmpty()) " ($it)" else "" }) + ". Wait a few minutes."
+            e.startsWith("HTTP") -> "ntfy.sh error (" + e.substringBefore("|") + ")."
             e.startsWith("net:") -> "can't reach ntfy.sh (" + e.removePrefix("net:") + "). It may be blocked or slow on this network."
             else -> "check your connection."
         }
@@ -121,8 +121,8 @@ object Core {
         if (fname != null) h.setRequestProperty("Filename", fname)
         h.outputStream.use { it.write(body) }
         val code = h.responseCode
-        lastErr = if (code == 200) "" else "HTTP $code"
         val txt = try { (if (code == 200) h.inputStream else h.errorStream).bufferedReader().readText() } catch (e: Exception) { "" }
+        lastErr = if (code == 200) "" else "HTTP $code|" + (try { JSONObject(txt).optString("error") } catch (e: Exception) { "" })
         h.disconnect()
         return Pair(code == 200, txt)
     }
@@ -138,10 +138,10 @@ object Core {
             var tries = 0
             while (tries < 3 && !ok) {
                 try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
-                val retry = !ok && (lastErr == "HTTP 429" || lastErr.startsWith("net:") || lastErr.startsWith("HTTP 5"))
+                val retry = !ok && (lastErr.startsWith("HTTP 429") || lastErr.startsWith("net:") || lastErr.startsWith("HTTP 5"))
                 if (!retry) break
                 tries++
-                if (tries < 3) Thread.sleep(if (tries == 1) 2000L else 5000L)
+                if (tries < 3) Thread.sleep(if (lastErr.startsWith("HTTP 429")) 6000L else if (tries == 1) 2000L else 5000L)
             }
             if (track && !ok) mark(c, id, 2)
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
@@ -502,12 +502,16 @@ class ListenService : Service() {
     override fun onDestroy() { running = false; poller = null; Core.armWatchdog(this, 5000L); super.onDestroy() }
     override fun onTaskRemoved(i: Intent?) { Core.armWatchdog(this, 5000L); super.onTaskRemoved(i) }
     private var netCb = false
+    private var lastKick = 0L
     private fun watchNetwork() {
         if (netCb) return
         try {
             val cm = getSystemService(ConnectivityManager::class.java)
             cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(n: Network) { Thread { try { conn?.disconnect() } catch (e: Exception) {} }.start() }
+                override fun onAvailable(n: Network) {
+                    val now = System.currentTimeMillis()
+                    if (now - lastKick > 60000L) { lastKick = now; Thread { try { conn?.disconnect() } catch (e: Exception) {} }.start() }
+                }
             })
             netCb = true
         } catch (e: Exception) {}
@@ -600,6 +604,9 @@ class ListenService : Service() {
             val h = URL("https://ntfy.sh/$topic/json?poll=1&since=$since").openConnection() as HttpURLConnection
             h.connectTimeout = 15000; h.readTimeout = 30000
             h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
+            val rc = h.responseCode
+            if (rc == 429) return "ntfy.sh rate limit reached. Wait a few minutes."
+            if (rc != 200) return "ntfy.sh error ($rc)"
             var logs = 0; var fresh = 0; var rec = 0
             h.inputStream.bufferedReader().forEachLine { line ->
                 try {
@@ -624,34 +631,48 @@ class ListenService : Service() {
     }
 
     private fun loop(key: String, sfx: String, cb: (JSONObject, Long) -> Unit) {
+        var fails = 0
         while (true) {
             val p = Core.prefs(this)
             val topic = p.getString(key, "")!!
             if (topic.isEmpty()) { Thread.sleep(5000); continue }
+            var got = false
+            var wait = 5000L
             try {
                 val last = p.getLong("lastT$sfx", 0L)
                 val since = if (last > 0) last else System.currentTimeMillis() / 1000 - 7200
                 val h = URL("https://ntfy.sh/$topic/json?since=$since").openConnection() as HttpURLConnection
                 h.readTimeout = 120000; h.connectTimeout = 20000; conn = h
                 h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
-                h.inputStream.bufferedReader().forEachLine { line ->
-                    if (Core.prefs(this).getString(key, "") != topic) throw RuntimeException("code changed")
-                    p.edit().putLong("hb$sfx", System.currentTimeMillis()).apply()
-                    try {
-                        val o = JSONObject(line)
-                        if (o.optString("event") == "message") {
-                            val tm = o.optLong("time"); val id = o.optString("id")
-                            val lt = p.getLong("lastT$sfx", 0L)
-                            if (tm > lt || (tm == lt && id != p.getString("lastId$sfx", ""))) {
-                                p.edit().putLong("lastT$sfx", tm).putString("lastId$sfx", id).apply()
-                                val age = System.currentTimeMillis() / 1000 - tm
-                                if (age < 21600) cb(JSONObject(o.getString("message")), age)
+                val code = h.responseCode
+                if (code == 429) {
+                    wait = maxOf(h.getHeaderField("Retry-After")?.toLongOrNull() ?: 60L, 60L) * 1000L
+                    h.disconnect()
+                } else if (code != 200) {
+                    h.disconnect()
+                } else {
+                    h.inputStream.bufferedReader().forEachLine { line ->
+                        got = true
+                        if (Core.prefs(this).getString(key, "") != topic) throw RuntimeException("code changed")
+                        p.edit().putLong("hb$sfx", System.currentTimeMillis()).apply()
+                        try {
+                            val o = JSONObject(line)
+                            if (o.optString("event") == "message") {
+                                val tm = o.optLong("time"); val id = o.optString("id")
+                                val lt = p.getLong("lastT$sfx", 0L)
+                                if (tm > lt || (tm == lt && id != p.getString("lastId$sfx", ""))) {
+                                    p.edit().putLong("lastT$sfx", tm).putString("lastId$sfx", id).apply()
+                                    val age = System.currentTimeMillis() / 1000 - tm
+                                    if (age < 21600) cb(JSONObject(o.getString("message")), age)
+                                }
                             }
-                        }
-                    } catch (e: Throwable) {}
+                        } catch (e: Throwable) {}
+                    }
                 }
             } catch (e: Throwable) {}
-            Thread.sleep(5000)
+            if (got) fails = 0 else fails++
+            if (wait == 5000L && fails > 1) wait = minOf(300000L, 5000L shl minOf(fails - 1, 6))
+            Thread.sleep(wait)
         }
     }
 }
@@ -660,7 +681,9 @@ class WatchdogReceiver : BroadcastReceiver() {
     override fun onReceive(c: Context, i: Intent) {
         Core.armWatchdog(c)
         if (!ListenService.running || !ListenService.alive) { try { c.startForegroundService(Intent(c, ListenService::class.java)) } catch (e: Exception) {} }
-        else { val pr = goAsync(); Thread { try { ListenService.poller?.invoke(false) } catch (e: Exception) {}; pr.finish() }.start() }
+        else if (System.currentTimeMillis() - Core.prefs(c).getLong("hb", 0L) > 100000L) {
+            val pr = goAsync(); Thread { try { ListenService.poller?.invoke(false) } catch (e: Exception) {}; pr.finish() }.start()
+        }
     }
 }
 
