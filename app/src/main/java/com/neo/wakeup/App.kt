@@ -84,6 +84,14 @@ object Core {
     fun prefs(c: Context): SharedPreferences = c.getSharedPreferences("p", 0)
     private val waiters = HashMap<String, (Boolean) -> Unit>()
     @Volatile var lastErr = ""
+    fun base(c: Context): String {
+        val b = prefs(c).getString("srv", "")!!.trim().trimEnd('/')
+        return if (b.isEmpty()) "https://ntfy.sh" else if (b.startsWith("http")) b else "https://$b"
+    }
+    fun auth(c: Context, h: HttpURLConnection) {
+        val t = prefs(c).getString("tok", "")!!.trim()
+        if (t.isNotEmpty()) h.setRequestProperty("Authorization", "Bearer $t")
+    }
     fun whyFailed(): String {
         val e = lastErr
         return when {
@@ -115,9 +123,10 @@ object Core {
         nm.createNotificationChannel(a)
     }
 
-    private fun rawPost(topic: String, body: ByteArray, put: Boolean = false, fname: String? = null): Pair<Boolean, String> {
-        val h = URL("https://ntfy.sh/$topic").openConnection() as HttpURLConnection
-        h.requestMethod = if (put) "PUT" else "POST"; h.doOutput = true; h.connectTimeout = 15000; h.readTimeout = 30000
+    private fun rawPost(c: Context, topic: String, body: ByteArray, put: Boolean = false, fname: String? = null): Pair<Boolean, String> {
+        val h = URL(base(c) + "/$topic").openConnection() as HttpURLConnection
+        h.requestMethod = if (put) "PUT" else "POST"; h.doOutput = true; h.connectTimeout = if (put) 15000 else 8000; h.readTimeout = if (put) 30000 else 12000
+        auth(c, h)
         if (fname != null) h.setRequestProperty("Filename", fname)
         h.outputStream.use { it.write(body) }
         val code = h.responseCode
@@ -136,12 +145,12 @@ object Core {
             var ok = false
             if (track) log(c, 0, describe(o), id, 0)
             var tries = 0
-            while (tries < 3 && !ok) {
-                try { ok = rawPost(t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
+            while (tries < 2 && !ok) {
+                try { ok = rawPost(c, t, o.toString().toByteArray()).first } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
                 val retry = !ok && (lastErr.startsWith("HTTP 429") || lastErr.startsWith("net:") || lastErr.startsWith("HTTP 5"))
                 if (!retry) break
                 tries++
-                if (tries < 3) Thread.sleep(if (lastErr.startsWith("HTTP 429")) 6000L else if (tries == 1) 2000L else 5000L)
+                if (tries < 2) Thread.sleep(if (lastErr.startsWith("HTTP 429")) 6000L else if (tries == 1) 2000L else 5000L)
             }
             if (track && !ok) mark(c, id, 2)
             if (done != null) Handler(Looper.getMainLooper()).post { done(ok) }
@@ -150,9 +159,9 @@ object Core {
     }
     fun send(c: Context, type: String, done: ((Boolean) -> Unit)? = null): String = postJson(c, JSONObject().put("t", type), done)
 
-    fun postTo(topic: String, body: ByteArray): Boolean = rawPost(topic, body).first
-    fun postToErr(topic: String, body: ByteArray): String = try {
-        val r = rawPost(topic, body); if (r.first) "" else "Server refused it: " + r.second.take(80)
+    fun postTo(c: Context, topic: String, body: ByteArray): Boolean = rawPost(c, topic, body).first
+    fun postToErr(c: Context, topic: String, body: ByteArray): String = try {
+        val r = rawPost(c, topic, body); if (r.first) "" else "Server refused it: " + r.second.take(80)
     } catch (e: Exception) { "Can't reach ntfy.sh" }
     fun armWatchdog(c: Context, ms: Long = 120000L) {
         try {
@@ -217,11 +226,11 @@ object Core {
                     while (opt.outWidth / ss > 1400 || opt.outHeight / ss > 1400) ss *= 2
                     val bmp = c.contentResolver.openInputStream(img).use { BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = ss }) }!!
                     val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.JPEG, 80, bos)
-                    val r = rawPost(t, bos.toByteArray(), true, "photo.jpg")
+                    val r = rawPost(c, t, bos.toByteArray(), true, "photo.jpg")
                     if (!r.first) throw Exception("upload failed")
                     o.put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
                 }
-                ok = rawPost(t, o.toString().toByteArray()).first
+                ok = rawPost(c, t, o.toString().toByteArray()).first
             } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
             if (!ok) mark(c, id, 2)
             Handler(Looper.getMainLooper()).post { done(ok) }
@@ -238,10 +247,10 @@ object Core {
             log(c, 0, "Drawing synced", id, 0)
             try {
                 val bos = ByteArrayOutputStream(); bmp.compress(Bitmap.CompressFormat.PNG, 100, bos)
-                val r = rawPost(t, bos.toByteArray(), true, "board.png")
+                val r = rawPost(c, t, bos.toByteArray(), true, "board.png")
                 if (r.first) {
                     val o = JSONObject().put("t", "board").put("id", id).put("img", JSONObject(r.second).getJSONObject("attachment").getString("url"))
-                    ok = rawPost(t, o.toString().toByteArray()).first
+                    ok = rawPost(c, t, o.toString().toByteArray()).first
                 }
             } catch (e: Exception) { lastErr = "net:" + e.javaClass.simpleName }
             if (!ok) mark(c, id, 2)
@@ -601,9 +610,9 @@ class ListenService : Service() {
         return try {
             val last0 = p.getLong("lastT", 0L)
             val since = if (deep || last0 == 0L) System.currentTimeMillis() / 1000 - 43200 else last0 - 60
-            val h = URL("https://ntfy.sh/$topic/json?poll=1&since=$since").openConnection() as HttpURLConnection
+            val h = URL(Core.base(this) + "/$topic/json?poll=1&since=$since").openConnection() as HttpURLConnection
             h.connectTimeout = 15000; h.readTimeout = 30000
-            h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
+            h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false; Core.auth(this, h)
             val rc = h.responseCode
             if (rc == 429) return "ntfy.sh rate limit reached. Wait a few minutes."
             if (rc != 200) return "ntfy.sh error ($rc)"
@@ -641,9 +650,9 @@ class ListenService : Service() {
             try {
                 val last = p.getLong("lastT$sfx", 0L)
                 val since = if (last > 0) last else System.currentTimeMillis() / 1000 - 7200
-                val h = URL("https://ntfy.sh/$topic/json?since=$since").openConnection() as HttpURLConnection
+                val h = URL(Core.base(this) + "/$topic/json?since=$since").openConnection() as HttpURLConnection
                 h.readTimeout = 120000; h.connectTimeout = 20000; conn = h
-                h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false
+                h.setRequestProperty("Accept-Encoding", "identity"); h.useCaches = false; Core.auth(this, h)
                 val code = h.responseCode
                 if (code == 429) {
                     wait = maxOf(h.getHeaderField("Retry-After")?.toLongOrNull() ?: 60L, 60L) * 1000L
@@ -697,7 +706,7 @@ class ReplyReceiver : BroadcastReceiver() {
 }
 
 object Backup {
-    private val SKIP = setOf("lastT", "lastId", "hb", "snz", "snzu", "pend", "dnd_until", "bk_ok")
+    private val SKIP = setOf("lastT", "lastId", "hb", "snz", "snzu", "pend", "dnd_until", "bk_ok", "tok")
     private fun dir(): java.io.File? = try {
         if (Build.VERSION.SDK_INT >= 30 && !Environment.isExternalStorageManager()) null
         else java.io.File(Environment.getExternalStorageDirectory(), "WakeUp").also { it.mkdirs() }
@@ -784,7 +793,7 @@ object NotifForward {
             for (e in es) { arr.put(e); val z = gz(arr.toString()); if (z.length > 3000) break; best = z; n++ }
             if (n == 0) { MacroQueue.drop(c, 1); continue }
             val body = JSONObject().put("t", "nlog").put("id", Core.rid()).put("z", best).put("n", n).toString().toByteArray()
-            val err = Core.postToErr(target, body)
+            val err = Core.postToErr(c, target, body)
             if (err.isNotEmpty()) { p.edit().putString("nf_err", err).apply(); return false }
             MacroQueue.drop(c, n); p.edit().putLong("nf_last", System.currentTimeMillis()).putString("nf_err", "").apply(); sent.add(System.currentTimeMillis())
             Thread.sleep(1500)
@@ -1665,6 +1674,18 @@ class MainActivity : Base() {
         }
         return c?.let { Intent().setComponent(ComponentName(it.first, it.second)) }
     }
+    private fun showServer() {
+        val p = Core.prefs(this)
+        val srv = field("Server (blank = ntfy.sh)", p.getString("srv", "")!!)
+        val tok = field("Access token (optional)", p.getString("tok", "")!!)
+        val box = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        var d: Dialog? = null
+        box.put(tv("Server", 22f, t.text, true).apply { gravity = Gravity.CENTER }, 0)
+        box.put(tv("Optional. A free ntfy.sh account token gives you your own send limits instead of sharing your network's.", 12f, t.sub), 12)
+        box.put(srv, 14); box.put(tok, 10)
+        box.put(btn("Save", true) { p.edit().putString("srv", srv.text.toString().trim()).putString("tok", tok.text.toString().trim()).apply(); d?.dismiss() }, 16)
+        val dlg = themedDialog(box); d = dlg; dlg.show()
+    }
     private fun showPerms() {
         permDlg?.dismiss()
         val upd = ArrayList<() -> Unit>()
@@ -1766,7 +1787,7 @@ class MainActivity : Base() {
             col.put(card(mlLbl, sw("Also show as notifications", p.getBoolean("ml_notify", false)) { v -> p.edit().putBoolean("ml_notify", v).apply() },
                 row(btn("Check now", false) { checkNow() }, btn("Open log", true) { startActivity(Intent(this, MacroLogActivity::class.java)) })), 14)
         }
-        col.put(btn("Permissions", false) { showPerms() }, 14)
+        col.put(row(btn("Permissions", false) { showPerms() }, btn("Server", false) { showServer() }), 14)
         sScroll.addView(col)
         val y = keepY; val x = keepX; keepY = 0; keepX = 0
         if (y > 0 || x > 0) sScroll.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
